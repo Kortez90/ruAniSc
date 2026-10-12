@@ -78,8 +78,7 @@ try:
 except ImportError:
     print(
         "Не найден пакет anime_parsers_ru.\n"
-        "Установи: pip install anime-parsers-ru\n"
-        "(если pip ругается на externally managed environment — см. README.md)",
+        "Установи: pip install anime-parsers-ru\n",
         file=sys.stderr,
     )
     sys.exit(1)
