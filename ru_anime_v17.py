@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import urllib.request
 import urllib.error
 
-VERSION = "v14"
+VERSION = "v17"
 
 def history_path() -> str:
     state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
@@ -65,19 +65,77 @@ def remember_search(query: str) -> None:
     data["searches"] = ([query] + searches)[:20]
     save_history(data)
 
-def remember_session(query: str, candidate: Candidate, episode: int) -> None:
+def remember_session(query: str, candidate: Candidate, episode: int, status: str = "current") -> None:
     if not query:
         return
     data = load_history()
-    data["last_session"] = {
+    now = int(time.time())
+    session = {
         "query": query,
         "title": candidate.title,
         "label": candidate.label,
         "source": candidate.source,
         "episode": episode,
+        "status": status,
+        "updated_at": now,
     }
+    data["last_session"] = session
+    items = data.setdefault("watch_history", [])
+    if not isinstance(items, list):
+        items = []
+        data["watch_history"] = items
+    key = (query.casefold(), str(candidate.label).casefold())
+    existing = next((item for item in items if isinstance(item, dict) and
+                      (str(item.get("query", "")).casefold(), str(item.get("label", "")).casefold()) == key), None)
+    if existing is None:
+        existing = {"query": query, "title": candidate.title, "label": candidate.label,
+                    "source": candidate.source, "episode": episode, "watched_episodes": [],
+                    "status": status, "updated_at": now}
+        items.insert(0, existing)
+    else:
+        existing.update({"query": query, "title": candidate.title, "label": candidate.label,
+                         "source": candidate.source, "episode": episode,
+                         "status": status, "updated_at": now})
+    data["watch_history"] = items[:50]
     searches = [q for q in data.get("searches", []) if isinstance(q, str) and q.casefold() != query.casefold()]
     data["searches"] = ([query] + searches)[:20]
+    save_history(data)
+
+def mark_episode_watched(query: str, candidate: Candidate, episode: int) -> None:
+    if not query:
+        return
+    data = load_history()
+    items = data.get("watch_history", [])
+    if not isinstance(items, list):
+        return
+    for item in items:
+        if isinstance(item, dict) and str(item.get("query", "")).casefold() == query.casefold() and str(item.get("label", "")).casefold() == candidate.label.casefold():
+            watched = item.setdefault("watched_episodes", [])
+            if episode not in watched:
+                watched.append(episode)
+                watched.sort()
+            item["status"] = "paused"
+            item["updated_at"] = int(time.time())
+            break
+    save_history(data)
+
+def set_session_status(query: str, candidate: Candidate, episode: int, status: str) -> None:
+    if not query:
+        return
+    data = load_history()
+    session = data.get("last_session")
+    if isinstance(session, dict) and str(session.get("query", "")).casefold() == query.casefold() and str(session.get("label", "")).casefold() == candidate.label.casefold():
+        session["status"] = status
+        session["episode"] = episode
+        session["updated_at"] = int(time.time())
+    items = data.get("watch_history", [])
+    if isinstance(items, list):
+        for item in items:
+            if isinstance(item, dict) and str(item.get("query", "")).casefold() == query.casefold() and str(item.get("label", "")).casefold() == candidate.label.casefold():
+                item["status"] = status
+                item["episode"] = episode
+                item["updated_at"] = int(time.time())
+                break
     save_history(data)
 
 def _managed_venv_path() -> str:
@@ -119,15 +177,27 @@ def ensure_python_dependencies() -> None:
             missing.append("anime-parsers-ru")
         if importlib.util.find_spec("anicli_api") is None:
             missing.append("anicli-api")
+        upgrade_anicli = False
+        if not missing:
+            try:
+                upgrade_anicli = importlib.util.find_spec("anicli_api.source.anilib_me") is None
+            except (ImportError, ModuleNotFoundError, ValueError):
+                upgrade_anicli = True
     except (ImportError, ValueError):
         missing = ["anime-parsers-ru", "anicli-api"]
+        upgrade_anicli = False
 
-    if missing:
-        print("Устанавливаю зависимости в пользовательское окружение: " + ", ".join(missing), flush=True)
-        result = subprocess.run([sys.executable, "-m", "pip", "install", *missing], check=False)
+    if missing or upgrade_anicli:
+        packages = list(missing)
+        if upgrade_anicli and "anicli-api" not in packages:
+            packages.extend(["--upgrade", "anicli-api"])
+        print("Устанавливаю/обновляю зависимости в пользовательском окружении: " + ", ".join(packages), flush=True)
+        result = subprocess.run([sys.executable, "-m", "pip", "install", *packages], check=False)
         if result.returncode != 0:
             print("Не удалось установить Python-зависимости. Проверьте подключение к интернету и повторите запуск.", file=sys.stderr)
             raise SystemExit(result.returncode or 1)
+        if upgrade_anicli and not missing:
+            os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
 
 def _privileged_command(command: list[str]) -> list[str]:
@@ -280,6 +350,8 @@ class Candidate:
     kodik_translation_id: str | None = None
     resolver: Callable[[int], "tuple[Optional[str], Optional[dict]]"] | None = None
     group_options: "list[Candidate] | None" = None
+    dub_label: str | None = None
+    quality_label: str | None = None
 
 _QUALITY_P_RE = re.compile(r"(\d{3,4})p\b")
 
@@ -336,6 +408,33 @@ def choose(items: Sequence[T], render: Callable[[T], str],
             return items[int(raw) - 1]
         print("Некорректный номер, попробуй ещё раз.")
 
+def choose_paged(items: Sequence[T], render: Callable[[T], str], start_index: int = 0) -> T | None:
+    if not items:
+        return None
+    index = max(0, min(start_index, len(items) - 1))
+    while True:
+        print("\n" + "═" * 64)
+        print(f"Результат {index + 1} из {len(items)}")
+        print(render(items[index]))
+        print("[n] следующий  [p] предыдущий  [s] выбрать  [q] назад")
+        raw = input("> ").strip().lower()
+        if raw in ("", "q", "0"):
+            return None
+        if raw == "n":
+            if index + 1 < len(items):
+                index += 1
+            else:
+                print("Это последний результат.")
+        elif raw == "p":
+            if index > 0:
+                index -= 1
+            else:
+                print("Это первый результат.")
+        elif raw in ("s", "enter", "выбрать"):
+            return items[index]
+        else:
+            print("Команды: n — следующий, p — предыдущий, s — выбрать, q — назад.")
+
 def nav_choice(valid_commands: str, help_text: str) -> str:
 
     while True:
@@ -361,7 +460,7 @@ def play_in_mpv(
             "          sudo apt install mpv (Debian/Ubuntu)"
         )
         return None
-    cmd = [path, url, f"--force-media-title={title}"]
+    cmd = [path, url, f"--force-media-title={title}", "--save-position-on-quit"]
     if prefer_max_hls_bitrate and ".m3u8" in url.lower():
         cmd.append("--hls-bitrate=max")
     header_fields = []
@@ -440,12 +539,14 @@ def build_animego_candidates(parser: AnimegoParser, anime_id: str, title: str) -
         tag = "озвучка" if is_dub_label(voice.label) else "субтитры"
         candidates.append(Candidate(
             source="animego",
-            label=f"[animego/{voice.player}] {title} — {voice.label} ({tag})",
+            label=f"[animego/{voice.player}] {title} — {voice.label} ({tag}; качество: авто)",
             title=title,
             animego_anime_id=anime_id,
             animego_voice=voice,
             episodes_released=episodes_released,
             episodes_total=episodes_total,
+            dub_label=voice.label,
+            quality_label="авто",
         ))
     return candidates, None
 
@@ -538,7 +639,10 @@ def build_kodik_candidates(query: str, kodik_token: Optional[str], limit: int = 
                 episodes_released=el_ep_released, episodes_total=el_ep_total,
                 kodik_id=str(lookup_id), kodik_id_type=id_type,
                 kodik_translation_id=str(t_id) if t_id else "0",
+                dub_label=str(t_title or "Озвучка по умолчанию"),
+                quality_label=str(getattr(el, "quality", "") or "авто"),
             ))
+            sub_candidates[-1].label += f" (качество: {sub_candidates[-1].quality_label})"
 
         if not sub_candidates:
             continue
@@ -602,6 +706,8 @@ def build_kodik_candidates_by_external_id(
                 episodes_released=episodes_released, episodes_total=episodes_total,
                 kodik_id=id_value, kodik_id_type=id_type,
                 kodik_translation_id=str(t_id) if t_id else "0",
+                dub_label=str(t_title or "Озвучка по умолчанию"),
+                quality_label="авто",
             ))
     except Exception as e:
         search_err = f"Kodik: поиск по {id_type}_id не сработал ({type(e).__name__}: {e}), пробую озвучку по умолчанию"
@@ -689,7 +795,7 @@ def shikimori_full_info(query: str) -> list[dict]:
     if not results:
         return []
 
-    top_results = results[:8]
+    top_results = results[:1]
 
     def _fetch_one(item: dict) -> dict:
         link = item.get("link")
@@ -742,7 +848,7 @@ def _show_kitty_poster(url: str | None) -> None:
             path = f.name
         try:
             result = subprocess.run(
-                ["kitty", "+kitten", "icat", "--align=left", path],
+                ["kitty", "+kitten", "icat", "--align=left", "--place=16x10@0x0", path],
                 stdout=sys.stdout, stderr=subprocess.DEVNULL, check=False, timeout=8,
             )
             if result.returncode == 0:
@@ -836,7 +942,7 @@ def print_shikimori_info(infos: list[dict]) -> None:
             print("Связанные тайтлы: " + "; ".join(related_titles))
     print(f"\n{'═' * 64}")
 
-def make_anicli_resolver(episodes: list, source_title: str) -> Callable[[int], "tuple[Optional[str], Optional[dict]]"]:
+def make_anicli_resolver(episodes: list, source_title: str, target_quality: int | None = None) -> Callable[[int], "tuple[Optional[str], Optional[dict]]"]:
 
     def _resolve(episode_num: int):
         ep_obj = next((e for e in episodes if str(getattr(e, "ordinal", "")) == str(episode_num)), None)
@@ -860,7 +966,7 @@ def make_anicli_resolver(episodes: list, source_title: str) -> Callable[[int], "
         video = None
         try:
             from anicli_api.tools.helpers import get_video_by_quality
-            video = get_video_by_quality(videos, 1080)
+            video = get_video_by_quality(videos, target_quality or 1080)
         except Exception:
             pass
         if video is None:
@@ -919,12 +1025,70 @@ def build_anicli_candidates(module_name: str, label: str, query: str) -> tuple[l
     candidates = []
     for i, src in enumerate(sources):
         src_title = getattr(src, "title", None) or f"вариант {i + 1}"
-        candidates.append(Candidate(
-            source=label, label=f"[{label}] {title} — {src_title}",
-            title=title, episodes_released=episodes_count, episodes_total=episodes_count,
-            resolver=make_anicli_resolver(episodes, src_title),
-        ))
+        qualities = []
+        try:
+            for video in src.get_videos():
+                try:
+                    quality = int(getattr(video, "quality", 0) or 0)
+                except (TypeError, ValueError):
+                    quality = 0
+                if quality > 0 and quality not in qualities:
+                    qualities.append(quality)
+        except Exception:
+            pass
+        qualities.sort(reverse=True)
+        if not qualities:
+            qualities = [None]
+        for quality in qualities:
+            quality_text = f"{quality}p" if quality else "авто"
+            candidates.append(Candidate(
+                source=label, label=f"[{label}] {title} — {src_title} ({quality_text})",
+                title=title, episodes_released=episodes_count, episodes_total=episodes_count,
+                resolver=make_anicli_resolver(episodes, src_title, quality),
+                dub_label=str(src_title), quality_label=quality_text,
+            ))
     return candidates, None
+
+
+def _candidate_leaves(candidates: Sequence[Candidate]) -> list[Candidate]:
+    leaves = []
+    for candidate in candidates:
+        if candidate.group_options:
+            leaves.extend(_candidate_leaves(candidate.group_options))
+        else:
+            leaves.append(candidate)
+    return leaves
+
+def _candidate_dub(candidate: Candidate) -> str:
+    if candidate.dub_label:
+        return candidate.dub_label.strip() or "Неизвестная озвучка"
+    label = candidate.label
+    if " — " in label:
+        return label.rsplit(" — ", 1)[-1].strip().split(" (", 1)[0]
+    return "Неизвестная озвучка"
+
+def group_candidates_by_dub(candidates: Sequence[Candidate]) -> list[Candidate]:
+    leaves = _candidate_leaves(candidates)
+    groups: dict[str, list[Candidate]] = {}
+    order: list[str] = []
+    for candidate in leaves:
+        dub = _candidate_dub(candidate)
+        key = re.sub(r"\s+", " ", dub).casefold()
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(candidate)
+    result = []
+    for key in order:
+        options = groups[key]
+        dub = _candidate_dub(options[0])
+        label = f"{dub} — {len(options)} вариантов" if len(options) != 1 else f"{dub} — {options[0].title}"
+        result.append(Candidate(
+            source="group", label=label, title=options[0].title,
+            episodes_released=None, episodes_total=None,
+            group_options=options, dub_label=dub,
+        ))
+    return sorted(result, key=lambda c: c.label.casefold())
 
 def unified_search(animego_parser: AnimegoParser, query: str, kodik_token: Optional[str]) -> list[Candidate]:
 
@@ -995,13 +1159,14 @@ def unified_search(animego_parser: AnimegoParser, query: str, kodik_token: Optio
     print(f"  Итого: {len(all_candidates)} вариантов просмотра")
     print("--------------------------------------")
 
-    return all_candidates
+    return group_candidates_by_dub(all_candidates)
 
 def _episode_session(
     resolve_fn: Callable[[int], Optional[str]], title: str,
     episodes_released: int | None = None, episodes_total: int | None = None,
     initial_episode: int | None = None,
     on_episode: Callable[[int], None] | None = None,
+    on_watched: Callable[[int], None] | None = None,
 ) -> str:
 
     if episodes_released and episodes_total and episodes_released != episodes_total:
@@ -1013,15 +1178,21 @@ def _episode_session(
     if episodes_released is not None and episodes_released <= 0:
         print("У источника пока нет доступных серий.")
         return "quit"
-    while True:
-        raw = input(f"\nС какой серии начать?{hint}: ").strip()
-        episode = int(raw) if raw.isdigit() and int(raw) > 0 else 1
-        if episodes_released is not None and episode > episodes_released:
-            print(f"Серия {episode} ещё не вышла. Сейчас доступно серий: {episodes_released}. Выбери доступную серию.")
-            continue
-        break
+    if initial_episode is not None and initial_episode > 0 and (episodes_released is None or initial_episode <= episodes_released):
+        episode = initial_episode
+        print(f"\nПродолжаю с {episode}-й серии.")
+    else:
+        while True:
+            raw = input(f"\nС какой серии начать?{hint}: ").strip()
+            episode = int(raw) if raw.isdigit() and int(raw) > 0 else 1
+            if episodes_released is not None and episode > episodes_released:
+                print(f"Серия {episode} ещё не вышла. Сейчас доступно серий: {episodes_released}. Выбери доступную серию.")
+                continue
+            break
 
     while True:
+        if on_episode:
+            on_episode(episode)
         print(f"\n=== {title} — серия {episode} ===")
         url = None
         headers = None
@@ -1045,6 +1216,8 @@ def _episode_session(
             print("\n[n] следующая  [p] предыдущая  [g] перейти к серии №...  [r] другой источник/озвучка  [q] выход в поиск")
             cmd = nav_choice("npgr", "Доступно: n, p, g, r, q.")
             if cmd == "n":
+                if on_watched:
+                    on_watched(episode)
                 if episodes_released is not None and episode >= episodes_released:
                     print(f"Следующая серия ещё не вышла. Сейчас доступно серий: {episodes_released}.")
                     continue
@@ -1111,11 +1284,15 @@ def watch_flow(
         if picked is None:
             return
 
-        if picked.group_options:
+        cancelled_group = False
+        while picked.group_options:
             sub = choose(picked.group_options, lambda c: c.label)
             if sub is None:
-                continue
+                cancelled_group = True
+                break
             picked = sub
+        if cancelled_group:
+            continue
 
         if picked.resolver is not None:
             resolve_fn = picked.resolver
@@ -1125,11 +1302,18 @@ def watch_flow(
             resolve_fn = lambda ep, p=picked: (resolve_kodik_candidate(p, ep, kodik_token), None)
 
         start_episode = resume_episode if resume_label == picked.label else None
+        current_episode = [start_episode or 1]
+        def save_current_episode(ep: int, q=query, c=picked) -> None:
+            current_episode[0] = ep
+            remember_session(q, c, ep, "current")
         signal = _episode_session(
             resolve_fn, picked.title, picked.episodes_released, picked.episodes_total,
             initial_episode=start_episode,
-            on_episode=lambda ep, q=query, c=picked: remember_session(q, c, ep),
+            on_episode=save_current_episode,
+            on_watched=lambda ep, q=query, c=picked: mark_episode_watched(q, c, ep),
         )
+        if query:
+            set_session_status(query, picked, current_episode[0], "paused")
         resume_episode = None
         if signal == "quit":
             return
@@ -1139,16 +1323,109 @@ def search_flow(animego_parser: AnimegoParser, query: str, kodik_token: Optional
     candidates = unified_search(animego_parser, query, kodik_token)
     watch_flow(animego_parser, candidates, kodik_token, query=query)
 
+def _short_status(item: dict) -> str:
+    watched = item.get("watched_episodes", [])
+    watched_count = len(watched) if isinstance(watched, list) else 0
+    episode = item.get("episode", 1)
+    if item.get("status") == "current":
+        state = "СЕЙЧАС"
+    elif watched_count:
+        state = "СМОТРЕЛ"
+    else:
+        state = "НЕ ЗАВЕРШЕНО"
+    return f"{state} · серия {episode} · просмотрено серий: {watched_count}"
+
 def history_flow(animego_parser: AnimegoParser, kodik_token: Optional[str]) -> None:
     data = load_history()
-    searches = [q for q in data.get("searches", []) if isinstance(q, str) and q.strip()]
-    if not searches:
-        print("История поиска пока пуста.")
+    items = [item for item in data.get("watch_history", []) if isinstance(item, dict) and item.get("query")]
+    if not items:
+        searches = [q for q in data.get("searches", []) if isinstance(q, str) and q.strip()]
+        if not searches:
+            print("\nИстория пока пуста.")
+            return
+        print("\nИстория поиска")
+        picked = choose(searches, lambda q: q, "Выбор запроса (номер, 0 — назад): ")
+        if picked:
+            search_flow(animego_parser, picked, kodik_token)
         return
-    print("\nПоследние поисковые запросы:")
-    picked = choose(searches, lambda q: q)
-    if picked:
-        search_flow(animego_parser, picked, kodik_token)
+    print("\n" + "═" * 68)
+    print("  ИСТОРИЯ ПРОСМОТРА")
+    print("═" * 68)
+    picked = choose(items, lambda item: f"{item.get('title') or item.get('query', '?')}  |  {_short_status(item)}",
+                    "Выбери тайтл (номер, 0 — назад): ")
+    if not picked:
+        return
+    query = str(picked.get("query") or "")
+    episode = picked.get("episode", 1)
+    try:
+        episode = int(episode)
+    except (TypeError, ValueError):
+        episode = 1
+    candidates = unified_search(animego_parser, query, kodik_token)
+    watch_flow(animego_parser, candidates, kodik_token, query=query,
+               resume_label=str(picked.get("label") or "") or None, resume_episode=episode)
+
+def home_screen() -> str:
+    data = load_history()
+    session = data.get("last_session")
+    items = [item for item in data.get("watch_history", []) if isinstance(item, dict) and item.get("query")]
+    watched = [item for item in items if item.get("watched_episodes")]
+    def row(value: str) -> None:
+        print("║" + value[:66].ljust(66) + "║")
+    print("\n" + "╔" + "═" * 66 + "╗")
+    row(" RU-ANIME")
+    print("╠" + "═" * 66 + "╣")
+    if isinstance(session, dict) and session.get("query"):
+        title = str(session.get("title") or session.get("query"))
+        episode = session.get("episode", 1)
+        row(f"Продолжить: {title} · серия {episode}")
+    else:
+        row("Продолжить: пока нечего")
+    row(f"Просмотренных тайтлов: {len(watched)}")
+    recent = items[:3]
+    if recent:
+        print("╠" + "═" * 66 + "╣")
+        row("Последнее просмотренное")
+        for item in recent:
+            title = str(item.get("title") or item.get("query") or "Без названия")
+            row(f"{title} · {_short_status(item)}")
+    print("╠" + "═" * 66 + "╣")
+    row("Enter  Поиск аниме")
+    row("S      Предложения текущего сезона")
+    row("C      Продолжить просмотр")
+    row("H      История и просмотренное")
+    row("Q      Выход")
+    print("╚" + "═" * 66 + "╝")
+    try:
+        if not sys.stdin.isatty():
+            return input("Выбор: ").strip().lower() or "search"
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                key = msvcrt.getwch().lower()
+                if key in ("\r", "\n"):
+                    return "search"
+                if key in ("s", "c", "h", "q", "\x03"):
+                    print(key.upper() if key != "\x03" else "^C")
+                    return "q" if key == "\x03" else key
+        else:
+            import termios, tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setraw(fd)
+                while True:
+                    key = sys.stdin.read(1).lower()
+                    if key in ("\r", "\n"):
+                        print("Enter")
+                        return "search"
+                    if key in ("s", "c", "h", "q", "\x03"):
+                        print(key.upper() if key != "\x03" else "^C")
+                        return "q" if key == "\x03" else key
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    except (EOFError, KeyboardInterrupt):
+        return "q"
 
 def resume_flow(animego_parser: AnimegoParser, kodik_token: Optional[str]) -> None:
     session = load_history().get("last_session")
@@ -1208,7 +1485,7 @@ def season_titles_flow(animego_parser: AnimegoParser, kodik_token: Optional[str]
     def _animego_job():
         return build_animego_candidates(animego_parser, anime_id, title)
 
-    jobs = {"animego": _animego_job, "kodik": lambda: build_kodik_candidates(title, None),
+    jobs = {"animego": _animego_job, "kodik": lambda: build_kodik_candidates(title, kodik_token),
             "shikimori": lambda: shikimori_full_info(title)}
     for module_name, label in ANICLI_SOURCES:
         jobs[label] = (lambda m=module_name, l=label: build_anicli_candidates(m, l, title))
@@ -1227,7 +1504,7 @@ def season_titles_flow(animego_parser: AnimegoParser, kodik_token: Optional[str]
             print(f"[!] {err}")
 
     remember_search(title)
-    watch_flow(animego_parser, all_candidates, None, query=title)
+    watch_flow(animego_parser, group_candidates_by_dub(all_candidates), kodik_token, query=title)
 
 def _is_doorway_style(text: str) -> bool:
 
@@ -1247,47 +1524,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_arg_parser().parse_args()
     ensure_mpv()
-
     animego_parser = AnimegoParser(mirror=args.mirror, proxy=args.proxy, use_cache=True)
-
-    print(f"ru_anime.py {VERSION}: поиск аниме с русской озвучкой (Ctrl+C — выход)")
-    print(
-        "Название сразу ищется одновременно во всех источниках (animego.me, "
-        "Kodik, YummyAnime, AnimeLib) — результаты появятся в одном списке "
-        "для выбора. Единый ввод: если вместо названия дать адрес сайта "
-        "конкретного тайтла (например 'название-jutsu.ru') — скрипт сам "
-        "распознает это и найдёт видео через Kodik по данным со страницы.\n"
-        "Команды: 'сезон' — текущий сезон; 'история' — прошлые запросы; "
-        "'продолжить' — возобновить последний просмотр."
-    )
-
+    print(f"ru_anime.py {VERSION} · поиск и просмотр аниме")
     try:
         while True:
-            query = input("\nНазвание аниме (Enter — выход): ").strip()
-            if not query:
+            action = home_screen()
+            if action == "q":
                 break
-
-            lower = query.lower()
-
-            if lower in ("season", "сезон", "сезоны", "онгоинги"):
+            if action == "s":
                 season_titles_flow(animego_parser, args.kodik_token)
                 continue
-
-            if lower in ("история", "history"):
-                history_flow(animego_parser, args.kodik_token)
-                continue
-
-            if lower in ("продолжить", "resume", "continue"):
+            if action == "c":
                 resume_flow(animego_parser, args.kodik_token)
                 continue
-
+            if action == "h":
+                history_flow(animego_parser, args.kodik_token)
+                continue
+            query = input("\nНазвание аниме (Enter — назад): ").strip()
+            if not query:
+                continue
             if _is_doorway_style(query):
                 doorway_flow(animego_parser, query, args.kodik_token)
-                continue
-
-            search_flow(animego_parser, query, args.kodik_token)
+            else:
+                search_flow(animego_parser, query, args.kodik_token)
     except KeyboardInterrupt:
-        print("\nПока!")
+        print("\nВыход.")
 
 if __name__ == "__main__":
     main()
