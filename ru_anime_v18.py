@@ -20,7 +20,7 @@ from urllib.parse import urlparse
 import urllib.request
 import urllib.error
 
-VERSION = "v17"
+VERSION = "v18"
 
 def history_path() -> str:
     state_home = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
@@ -177,8 +177,10 @@ def ensure_python_dependencies() -> None:
             missing.append("anime-parsers-ru")
         if importlib.util.find_spec("anicli_api") is None:
             missing.append("anicli-api")
+
         upgrade_anicli = False
-        if not missing:
+        upgrade_attempted = os.environ.get("RU_ANIME_ANICLI_UPGRADE_ATTEMPTED") == "1"
+        if not missing and not upgrade_attempted:
             try:
                 upgrade_anicli = importlib.util.find_spec("anicli_api.source.anilib_me") is None
             except (ImportError, ModuleNotFoundError, ValueError):
@@ -186,17 +188,19 @@ def ensure_python_dependencies() -> None:
     except (ImportError, ValueError):
         missing = ["anime-parsers-ru", "anicli-api"]
         upgrade_anicli = False
+        upgrade_attempted = True
 
     if missing or upgrade_anicli:
         packages = list(missing)
         if upgrade_anicli and "anicli-api" not in packages:
             packages.extend(["--upgrade", "anicli-api"])
-        print("Устанавливаю/обновляю зависимости в пользовательском окружении: " + ", ".join(packages), flush=True)
+        print("Устанавливаю/обновляю зависимости: " + ", ".join(packages), flush=True)
         result = subprocess.run([sys.executable, "-m", "pip", "install", *packages], check=False)
         if result.returncode != 0:
             print("Не удалось установить Python-зависимости. Проверьте подключение к интернету и повторите запуск.", file=sys.stderr)
             raise SystemExit(result.returncode or 1)
-        if upgrade_anicli and not missing:
+        if upgrade_anicli:
+            os.environ["RU_ANIME_ANICLI_UPGRADE_ATTEMPTED"] = "1"
             os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
 
 
